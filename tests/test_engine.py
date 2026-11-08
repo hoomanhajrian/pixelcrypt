@@ -1,5 +1,7 @@
+import hashlib
 import os
 import sys
+import tracemalloc
 
 import av
 import numpy as np
@@ -203,3 +205,244 @@ def test_invalid_dimensions_rejected(tmp_path, w, h):
     src = _write(tmp_path / "f", b"x")
     with pytest.raises(ValueError):
         encode_file_to_video(src, str(tmp_path / "o.mkv"), width=w, height=h)
+
+
+# ---------------------------------------------------------------------------
+# Format stability: videos written by the original in-memory engine (v1)
+# ---------------------------------------------------------------------------
+
+FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+GOLDEN_DATA = bytes(range(256)) * 6  # 1536 bytes, 3 frames at 16x16
+GOLDEN_PASSWORD = "pixelcrypt-golden"
+GOLDEN_TEXT = b"PixelCrypt golden stream\n"
+# build_stream("golden.txt", GOLDEN_TEXT[, GOLDEN_PASSWORD]) from the original
+# engine, with get_random_bytes(n) returning bytes(range(n)).
+GOLDEN_PLAIN_HEX = (
+    "50584352595054310100000000000000002d000a676f6c64656e2e747874000000000000"
+    "0019506978656c437279707420676f6c64656e2073747265616d0a"
+)
+GOLDEN_ENCRYPTED_HEX = (
+    "50584352595054310101000000000000003d000102030405060708090a0b0c0d0e0f0001"
+    "02030405060708090a0b000927c0a0fc00db9cb03820f38827a3fa294855c2fed894473d"
+    "ab25e01d079fa7a5d219562191d4d37edc1d3b4c89365eab89b369e1b26a3ceb8ab48c9f"
+    "a48605"
+)
+
+
+@pytest.mark.parametrize(
+    "video,name,password",
+    [
+        ("v1_plain.mkv", "golden-plain.bin", None),
+        ("v1_encrypted.mkv", "golden-secret.bin", GOLDEN_PASSWORD),
+    ],
+    ids=["plain", "encrypted"],
+)
+def test_v1_fixture_still_decodes(tmp_path, video, name, password):
+    out = decode_video_to_file(os.path.join(FIXTURES, video), str(tmp_path), password=password)
+    assert os.path.basename(out) == name
+    assert _read(out) == GOLDEN_DATA
+
+
+def test_stream_layout_matches_v1_golden(monkeypatch):
+    monkeypatch.setattr(engine, "get_random_bytes", lambda n: bytes(range(n)))
+    assert build_stream("golden.txt", GOLDEN_TEXT).hex() == GOLDEN_PLAIN_HEX
+    assert build_stream("golden.txt", GOLDEN_TEXT, GOLDEN_PASSWORD).hex() == GOLDEN_ENCRYPTED_HEX
+
+
+def test_video_frames_hold_stream_then_zero_padding(tmp_path, monkeypatch):
+    monkeypatch.setattr(engine, "get_random_bytes", lambda n: bytes(range(n)))
+    data = _random_bytes(FRAME_BYTES * 2 + 77, seed=5)
+    src = _write(tmp_path / "f.bin", data)
+    video = str(tmp_path / "f.mkv")
+    frames = encode_file_to_video(src, video, password=PASSWORD, width=W, height=H)
+    with av.open(video) as c:
+        raw = b"".join(engine._frame_to_bytes(f) for f in c.decode(video=0))
+    expected = build_stream("f.bin", data, PASSWORD)
+    assert len(raw) == frames * FRAME_BYTES
+    assert raw[: len(expected)] == expected
+    assert raw[len(expected) :] == bytes(len(raw) - len(expected))
+
+
+# ---------------------------------------------------------------------------
+# Streaming: progress, aborting, temporary files, memory
+# ---------------------------------------------------------------------------
+
+class _Stop(Exception):
+    pass
+
+
+def _stop_after(n):
+    calls = []
+
+    def progress(done, total):
+        calls.append(done)
+        if len(calls) >= n:
+            raise _Stop
+
+    return progress
+
+
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+@pytest.mark.parametrize("password", [None, PASSWORD], ids=["plain", "encrypted"])
+def test_progress_is_monotonic_and_completes(tmp_path, password):
+    data = CASES["multi_frame"]
+    src = _write(tmp_path / "p.bin", data)
+    video = str(tmp_path / "p.mkv")
+    enc, dec = [], []
+    frames = encode_file_to_video(
+        src, video, password=password, width=W, height=H,
+        progress=lambda d, t: enc.append((d, t)),
+    )
+    out = decode_video_to_file(
+        video, str(tmp_path / "restored"), password=password,
+        progress=lambda d, t: dec.append((d, t)),
+    )
+    assert _read(out) == data
+    assert len(enc) >= frames - 1
+    for calls in (enc, dec):
+        done = [d for d, _ in calls]
+        assert len({t for _, t in calls}) == 1
+        assert done == sorted(done)
+        assert done[-1] == calls[-1][1]
+
+
+def test_aborted_encode_leaves_no_files(tmp_path):
+    src = _write(tmp_path / "in.bin", CASES["multi_frame"])
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    with pytest.raises(_Stop):
+        encode_file_to_video(
+            src, str(out_dir / "v.mkv"), password=PASSWORD, width=W, height=H,
+            progress=_stop_after(2),
+        )
+    assert list(out_dir.iterdir()) == []
+
+
+def test_aborted_encode_keeps_existing_output(tmp_path):
+    src = _write(tmp_path / "in.bin", CASES["multi_frame"])
+    video = tmp_path / "v.mkv"
+    video.write_bytes(b"previous video")
+    with pytest.raises(_Stop):
+        encode_file_to_video(src, str(video), width=W, height=H, progress=_stop_after(1))
+    assert video.read_bytes() == b"previous video"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["in.bin", "v.mkv"]
+
+
+def test_aborted_decode_leaves_no_files(tmp_path):
+    src = _write(tmp_path / "in.bin", CASES["multi_frame"])
+    video = str(tmp_path / "v.mkv")
+    encode_file_to_video(src, video, password=PASSWORD, width=W, height=H)
+    restored = tmp_path / "restored"
+    with pytest.raises(_Stop):
+        decode_video_to_file(video, str(restored), password=PASSWORD, progress=_stop_after(2))
+    assert list(restored.iterdir()) == []
+
+
+def test_wrong_password_creates_no_files(tmp_path):
+    src = _write(tmp_path / "secret.bin", CASES["multi_frame"])
+    video = str(tmp_path / "v.mkv")
+    encode_file_to_video(src, video, password=PASSWORD, width=W, height=H)
+    restored = tmp_path / "restored"
+    with pytest.raises(WrongPasswordError):
+        decode_video_to_file(video, str(restored), password="wrong")
+    assert not restored.exists()
+
+
+@pytest.mark.parametrize("wrong", ["wrong", "Wrong!", "correct horse"])
+def test_wrong_password_fails_within_the_payload_prefix(wrong):
+    # With a wrong password FN_LEN decrypts to noise (up to 65535), so the
+    # decoder may read that many "filename" bytes, but no more: DATA_LEN then
+    # fails the length check. That is within the first frame at the default size.
+    stream = build_stream("f.bin", _random_bytes(200_000, seed=6), PASSWORD)
+    limit = 18 + 32 + 2 + 0xFFFF + 8  # headers + the largest possible prefix
+
+    def chunks():
+        yield stream[:limit]
+        raise AssertionError("the decoder read past the payload prefix")
+
+    def open_sink():
+        raise AssertionError("the output was opened before the password was checked")
+
+    with pytest.raises(WrongPasswordError):
+        engine._decode_stream(chunks(), wrong, open_sink)
+
+
+def _copy_frames(src_video, dst_video, keep):
+    """Write the first ``keep`` frames of a PixelCrypt video to a new video."""
+    with av.open(src_video) as c:
+        stream = c.streams.video[0]
+        width, height = stream.width, stream.height
+        chunks = [engine._frame_to_bytes(f) for f in c.decode(video=0)][:keep]
+    with av.open(dst_video, "w", format="matroska") as out:
+        s = out.add_stream(engine.CODEC, rate=30)
+        s.width, s.height, s.pix_fmt = width, height, engine.PIX_FMT
+        for chunk in chunks:
+            frame = engine._bytes_to_frame(np.frombuffer(chunk, dtype=np.uint8), width, height)
+            for p in s.encode(frame):
+                out.mux(p)
+        for p in s.encode():
+            out.mux(p)
+
+
+@pytest.mark.parametrize("password", [None, PASSWORD], ids=["plain", "encrypted"])
+def test_truncated_video_is_rejected_and_leaves_no_files(tmp_path, password):
+    src = _write(tmp_path / "in.bin", CASES["multi_frame"])
+    video = str(tmp_path / "v.mkv")
+    frames = encode_file_to_video(src, video, password=password, width=W, height=H)
+    truncated = str(tmp_path / "cut.mkv")
+    _copy_frames(video, truncated, keep=frames - 1)
+    restored = tmp_path / "restored"
+    with pytest.raises(NotPixelCryptError):
+        decode_video_to_file(truncated, str(restored), password=password)
+    assert list(restored.iterdir()) == []
+
+
+def test_decode_without_overwrite_picks_a_free_name(tmp_path):
+    src = _write(tmp_path / "doc.txt", b"new contents")
+    video = str(tmp_path / "doc.mkv")
+    encode_file_to_video(src, video, width=W, height=H)
+    restored = tmp_path / "restored"
+    restored.mkdir()
+    (restored / "doc.txt").write_bytes(b"old contents")
+    (restored / "doc (1).txt").write_bytes(b"older contents")
+
+    out = decode_video_to_file(video, str(restored), overwrite=False)
+    assert os.path.basename(out) == "doc (2).txt"
+    assert _read(out) == b"new contents"
+    assert (restored / "doc.txt").read_bytes() == b"old contents"
+
+    out = decode_video_to_file(video, str(restored))  # default: overwrite
+    assert out == str(restored / "doc.txt")
+    assert _read(out) == b"new contents"
+
+
+def test_memory_does_not_grow_with_file_size(tmp_path):
+    size = 48 * 1024 * 1024  # about 15 frames at 1080x1080
+    src = tmp_path / "big.bin"
+    rng = np.random.default_rng(7)
+    with open(src, "wb") as f:
+        for _ in range(size // (1 << 20)):
+            f.write(rng.integers(0, 256, 1 << 20, dtype=np.uint8).tobytes())
+    video = str(tmp_path / "big.mkv")
+
+    tracemalloc.start()
+    try:
+        encode_file_to_video(str(src), video, password=PASSWORD)
+        _, encode_peak = tracemalloc.get_traced_memory()
+        tracemalloc.reset_peak()
+        out = decode_video_to_file(video, str(tmp_path / "restored"), password=PASSWORD)
+        _, decode_peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert _sha256(out) == _sha256(src)
+    # Holding the whole file would need at least `size`; one frame is ~3.3 MiB.
+    assert encode_peak < size // 2, f"encode peaked at {encode_peak / 2**20:.1f} MiB"
+    assert decode_peak < size // 2, f"decode peaked at {decode_peak / 2**20:.1f} MiB"

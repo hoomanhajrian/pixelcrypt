@@ -19,4 +19,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements-dev.txt
-      - run: pytest -q
+      # Linux runners have no display, so the GUI tests run on a virtual one.
+      - name: Run tests (virtual display)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          xvfb-run -a pytest -q
+      - name: Run tests
+        if: runner.os != 'Linux'
+        run: pytest -q

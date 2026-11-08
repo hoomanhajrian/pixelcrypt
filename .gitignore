@@ -3,3 +3,6 @@ __pycache__/
 .pytest_cache/
 *.mkv
 .venv/
+!tests/fixtures/*.mkv
+build/
+dist/
