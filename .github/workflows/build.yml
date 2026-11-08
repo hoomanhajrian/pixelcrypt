@@ -1,0 +1,52 @@
+name: build
+
+# Builds the desktop app for each OS. Run it from the Actions tab, or push a
+# tag such as v1.0.0. Each build is smoke-tested with --self-test and uploaded
+# as a workflow artifact.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements-build.txt
+      - run: pyinstaller --clean --noconfirm pixelcrypt.spec
+
+      - name: Smoke test and package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          ./dist/PixelCrypt --self-test
+          tar -czf dist/PixelCrypt-linux-x64.tar.gz -C dist PixelCrypt
+      - name: Smoke test and package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          ./dist/PixelCrypt.app/Contents/MacOS/PixelCrypt --self-test
+          ditto -c -k --keepParent dist/PixelCrypt.app dist/PixelCrypt-macos.zip
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # A windowed .exe doesn't block the shell, so wait for its exit code.
+          $p = Start-Process -FilePath dist\PixelCrypt.exe -ArgumentList '--self-test' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "self-test failed with exit code $($p.ExitCode)" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PixelCrypt-${{ runner.os }}
+          path: |
+            dist/PixelCrypt-linux-x64.tar.gz
+            dist/PixelCrypt-macos.zip
+            dist/PixelCrypt.exe
+          if-no-files-found: error

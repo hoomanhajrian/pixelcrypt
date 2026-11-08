@@ -4,3 +4,5 @@ __pycache__/
 *.mkv
 .venv/
 !tests/fixtures/*.mkv
+build/
+dist/
